@@ -185,8 +185,161 @@ class Encoder(nn.Module):
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
 
-class Decoder(nn.Module):
+class MoEFeedForwardBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_experts: int = 8,
+        experts_used: int = 2,
+        dropout: float = 0.1,
+        bias: bool = False,
+        force_expert_utilization: bool = True
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.num_experts = num_experts
+        self.experts_used = experts_used
+        self.dropout = dropout
+        self.force_expert_utilization = force_expert_utilization
+        
+        hidden_dim = 4 * d_model
+        
+        # Shared expert (always used)
+        self.shared_expert = nn.Sequential(
+            nn.Linear(d_model, hidden_dim, bias=bias),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model, bias=bias)
+        )
+        
+        # Specialized experts
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model, hidden_dim, bias=bias),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, d_model, bias=bias)
+            ) for _ in range(num_experts)
+        ])
+        
+        # Gating network
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+        
+        # Tracking variables
+        self.register_buffer('expert_counts', torch.zeros(num_experts))
+        self.register_buffer('total_samples', torch.tensor(0))
+        self.current_batch_usage = None
+        
+        # Forced utilization parameters
+        if force_expert_utilization:
+            self.min_expert_fraction = 0.1  # Each expert should get at least 10% of tokens
+            self.expert_usage_history = []
+        
+        self._reset_parameters()
 
+    def _reset_parameters(self):
+        nn.init.normal_(self.gate.weight, std=0.02)
+        for expert in self.experts:
+            nn.init.xavier_uniform_(expert[0].weight)
+            nn.init.xavier_uniform_(expert[3].weight)
+            if expert[0].bias is not None:
+                nn.init.constant_(expert[0].bias, 0.)
+            if expert[3].bias is not None:
+                nn.init.constant_(expert[3].bias, 0.)
+        nn.init.xavier_uniform_(self.shared_expert[0].weight)
+        nn.init.xavier_uniform_(self.shared_expert[3].weight)
+        if self.shared_expert[0].bias is not None:
+            nn.init.constant_(self.shared_expert[0].bias, 0.)
+        if self.shared_expert[3].bias is not None:
+            nn.init.constant_(self.shared_expert[3].bias, 0.)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, d_model = x.shape
+        x_flat = x.view(-1, d_model)  # (batch*seq_len, d_model)
+        
+        # Shared expert path
+        shared_output = self.shared_expert(x)
+        
+        # Expert gating
+        gate_logits = self.gate(x_flat)  # (batch*seq_len, num_experts)
+        
+        # Add noise during training for exploration
+        if self.training:
+            noise = torch.randn_like(gate_logits) * 0.01
+            gate_logits = gate_logits + noise
+        
+        # Get top-k experts
+        top_k_gates, top_k_indices = gate_logits.topk(self.experts_used, dim=1)
+        top_k_gates = torch.softmax(top_k_gates, dim=1)
+        
+        # Forced expert utilization
+        if self.training and self.force_expert_utilization:
+            # Calculate current expert usage
+            expert_counts = torch.bincount(top_k_indices.flatten(), minlength=self.num_experts)
+            expert_fraction = expert_counts.float() / top_k_indices.numel()
+            
+            # Identify underutilized experts
+            underutilized = expert_fraction < self.min_expert_fraction
+            if underutilized.any():
+                # Calculate redistribution probability
+                num_underutilized = underutilized.sum()
+                total_redistribute = (self.min_expert_fraction - expert_fraction[underutilized]).sum()
+                
+                # Adjust gate logits to favor underutilized experts
+                gate_logits[:, underutilized] += total_redistribute / num_underutilized
+                
+                # Recompute top-k with adjusted logits
+                top_k_gates, top_k_indices = gate_logits.topk(self.experts_used, dim=1)
+                top_k_gates = torch.softmax(top_k_gates, dim=1)
+        
+        # Track expert usage
+        with torch.no_grad():
+            self.current_batch_usage = torch.bincount(
+                top_k_indices.flatten(),
+                minlength=self.num_experts
+            ).float()
+            self.current_batch_usage /= top_k_indices.numel()  # Convert to percentages
+            
+            if self.training:
+                self.expert_counts += self.current_batch_usage * x.size(0)
+                self.total_samples += x.size(0)
+                if self.force_expert_utilization:
+                    self.expert_usage_history.append(self.current_batch_usage.cpu())
+        
+        # Zero out non-selected experts
+        gates = torch.zeros_like(gate_logits)  # (batch*seq_len, num_experts)
+        gates.scatter_(1, top_k_indices, top_k_gates)  # Set only top-k gates
+        
+        # Process through all experts
+        expert_outputs = torch.stack([expert(x_flat) for expert in self.experts], dim=1)
+        
+        # Weighted combination of expert outputs
+        selected_experts = (expert_outputs * gates.unsqueeze(-1)).sum(dim=1)
+        selected_experts = selected_experts.view(batch_size, seq_len, d_model)
+        
+        # Combine with shared expert
+        return shared_output + selected_experts
+
+    def get_expert_usage(self, mode='current'):
+        """Returns expert usage statistics
+        Args:
+            mode: 'current' - last batch usage
+                  'average' - running average across all batches
+                  'history' - full history (if force_expert_utilization=True)
+        """
+        if mode == 'current':
+            return self.current_batch_usage
+        elif mode == 'average':
+            return self.expert_counts / (self.total_samples + 1e-6)
+        elif mode == 'history':
+            if not self.force_expert_utilization:
+                raise ValueError("History only available when force_expert_utilization=True")
+            return torch.stack(self.expert_usage_history) if self.expert_usage_history else None
+        else:
+            raise ValueError(f"Unknown mode {mode}")
+        
+# Then modify the Decoder class to use MoE
+class Decoder(nn.Module):
     def __init__(self, dim: int, n_heads: int, tgt_seq_len: int, custom_seq_len: int = 64, dropout: float = 0.0) -> None:
         super().__init__()
 
@@ -199,7 +352,14 @@ class Decoder(nn.Module):
         self.self_attention = Attention(self.dim, self.n_heads, self.tgt_seq_len)
         self.cross_attention = Attention(self.dim, self.n_heads, custom_seq_len)
 
-        self.feed_forward = FeedForwardBlock(self.dim)
+        # Replace standard FFN with MoE FFN
+        self.feed_forward = MoEFeedForwardBlock(
+            d_model=dim,
+            num_experts=8,  # Total experts
+            experts_used=2,  # Experts used per token
+            dropout=dropout,
+            bias=False
+        )
 
         # Normalization BEFORE the self attention block
         self.self_attention_norm = RMSNorm(self.dim, eps=1e-5)
@@ -224,7 +384,7 @@ class Decoder(nn.Module):
         out_n = self.cross_attention_norm(h)
         h = h + self.cross_attention.forward(out_n, encoder_output, encoder_output, src_mask)
 
-        # Feed-Forward with Residual Connection (single application)
+        # Feed-Forward with Residual Connection (now using MoE)
         out = h + self.feed_forward.forward(self.cross_ffn_norm(h))
 
         return out
